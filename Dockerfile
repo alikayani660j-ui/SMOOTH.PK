@@ -1,8 +1,9 @@
+FROM python:3.9-slim
 
-FROM python:3.10-slim
-
-# Install FFmpeg and system dependencies
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install system dependencies including FFmpeg
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -11,5 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Yahan 'main:app' ki jagah 'app:app' kar diya hai kyunki aapki file ka naam app.py hai
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]

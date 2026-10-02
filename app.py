@@ -107,6 +107,7 @@ HTML_CONTENT = """
         .loader-bar { width: 100%; background: #222; border-radius: 10px; height: 12px; overflow: hidden; margin: 20px 0; }
         .loader-fill { width: 0%; height: 100%; background: #00ffcc; transition: width 0.3s ease; }
     </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
 <body>
 

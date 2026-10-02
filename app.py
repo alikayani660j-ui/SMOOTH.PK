@@ -106,6 +106,21 @@ HTML_CONTENT = """
         #progress-overlay { display: none; text-align: center; padding: 30px; }
         .loader-bar { width: 100%; background: #222; border-radius: 10px; height: 12px; overflow: hidden; margin: 20px 0; }
         .loader-fill { width: 0%; height: 100%; background: #00ffcc; transition: width 0.3s ease; }
+    header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 15px;
+  gap: 10px;
+}
+
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
     </style>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>

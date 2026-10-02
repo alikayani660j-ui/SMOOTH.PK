@@ -23,12 +23,16 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 active_connections = set()
 
-desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-ffmpeg_search = glob.glob(os.path.join(desktop_path, "**", "ffmpeg.exe"), recursive=True)
+import shutil
 
-if ffmpeg_search:
-    FFMPEG_EXE = ffmpeg_search[0]
-else:
+# Check if ffmpeg is available in system path (Render/Linux) or local desktop
+if shutil.which("ffmpeg"):
+    FFMPEG_EXE = "ffmpeg"
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    ffmpeg_search = glob.glob(os.path.join(desktop_path, "**", "ffmpeg.exe"), recursive=True)
+    if ffmpeg_search:
+        FFMPEG_EXE = ffmpeg_search[0]
+        FFMPEG_EXE = "ffmpeg"
     FFMPEG_EXE = "ffmpeg"
 
 HTML_CONTENT = """

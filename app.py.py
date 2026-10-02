@@ -14,7 +14,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
+)    
 
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"

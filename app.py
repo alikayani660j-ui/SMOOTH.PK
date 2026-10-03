@@ -2,7 +2,6 @@ import os
 import subprocess
 import json
 import glob
-import shutil
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +14,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)      
+)
 
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
@@ -24,16 +23,13 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 active_connections = set()
 
-# --- ROBUST FFMPEG PATH DETECTION (Render & Local PC Safe) ---
-if shutil.which("ffmpeg"):
-    FFMPEG_EXE = "ffmpeg"
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+ffmpeg_search = glob.glob(os.path.join(desktop_path, "**", "ffmpeg.exe"), recursive=True)
+
+if ffmpeg_search:
+    FFMPEG_EXE = ffmpeg_search[0]
 else:
-    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-    ffmpeg_search = glob.glob(os.path.join(desktop_path, "**", "ffmpeg.exe"), recursive=True)
-    if ffmpeg_search:
-        FFMPEG_EXE = ffmpeg_search[0]
-    else:
-        FFMPEG_EXE = "ffmpeg"
+    FFMPEG_EXE = "ffmpeg"
 
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -45,9 +41,8 @@ HTML_CONTENT = """
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         body { background-color: #0c0c0e; color: #ffffff; line-height: 1.6; }
-        header { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 15px; gap: 10px; background: #121216; border-bottom: 1px solid #222; position: sticky; top: 0; z-index: 1000; }
+        header { display: flex; justify-content: space-between; align-items: center; padding: 20px 50px; background: #121216; border-bottom: 1px solid #222; position: sticky; top: 0; z-index: 1000; }
         .logo { font-size: 24px; font-weight: bold; color: #00ffcc; letter-spacing: 1px; }
-        nav { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
         nav a { color: #aaa; text-decoration: none; margin-left: 20px; font-size: 14px; transition: 0.3s; cursor: pointer; }
         nav a:hover, nav a.active { color: #00ffcc; }
         .live-badge { background: rgba(0, 255, 204, 0.1); border: 1px solid #00ffcc; padding: 5px 12px; border-radius: 20px; font-size: 13px; color: #00ffcc; display: flex; align-items: center; gap: 6px; }
@@ -73,16 +68,21 @@ HTML_CONTENT = """
         .btn:hover { background: #00cca3; transform: translateY(-2px); }
 
         .free-badge { background: rgba(0, 255, 204, 0.15); border: 1px solid #00ffcc; color: #00ffcc; padding: 8px 16px; border-radius: 8px; font-size: 14px; margin-bottom: 20px; display: inline-block; font-weight: bold; }
-        .guide-box { background: #121215; border: 1px solid #222; padding: 20px; border-radius: 10px; margin-top: 20px; font-size: 14px; color: #ccc; text-align: left; }
+
+        .guide-box { background: #121215; border: 1px solid #222; padding: 20px; border-radius: 10px; margin-top: 20px; font-size: 14px; color: #ccc; }
         .guide-box h3 { color: #00ffcc; margin-bottom: 10px; }
         .guide-box ul { padding-left: 20px; }
         .guide-box li { margin-bottom: 8px; }
 
+        /* GAMING BEFORE/AFTER SLIDER STYLES */
         .preview-container { margin-top: 25px; background: #121215; border: 1px solid #222; padding: 20px; border-radius: 12px; text-align: center; }
         .img-comparision-slider { position: relative; width: 100%; max-width: 600px; height: 350px; margin: 20px auto; overflow: hidden; border-radius: 8px; border: 1px solid #333; user-select: none; }
+        
         .slider-image-wrapper { position: absolute; top: 0; left: 0; width: 50%; height: 100%; overflow: hidden; z-index: 2; }
+        
         .slider-handle { position: absolute; top: 0; bottom: 0; left: 50%; width: 4px; background: #00ffcc; z-index: 3; cursor: ew-resize; }
         .slider-handle-button { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 36px; height: 36px; background: #00ffcc; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #000; font-weight: bold; font-size: 12px; box-shadow: 0 0 10px rgba(0,0,0,0.5); }
+        
         .badge-before { position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.8); color: #ff4d4d; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; z-index: 4; }
         .badge-after { position: absolute; top: 15px; right: 15px; background: rgba(0,0,0,0.8); color: #00ffcc; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; z-index: 4; }
 
@@ -102,6 +102,7 @@ HTML_CONTENT = """
         .price-card ul li::before { content: "✓ "; color: #00ffcc; font-weight: bold; }
 
         .result-box { margin-top: 20px; background: #121215; padding: 20px; border-radius: 10px; text-align: left; border: 1px solid #222; display: none; }
+        
         #progress-overlay { display: none; text-align: center; padding: 30px; }
         .loader-bar { width: 100%; background: #222; border-radius: 10px; height: 12px; overflow: hidden; margin: 20px 0; }
         .loader-fill { width: 0%; height: 100%; background: #00ffcc; transition: width 0.3s ease; }
@@ -139,7 +140,7 @@ HTML_CONTENT = """
                             <input type="file" name="file" id="file-input" required onchange="showFileName('file-input', 'upload-text', '📁 Drop your video here or click to browse')">
                             <div id="upload-text">
                                 <h3>📁 Drop your video here or click to browse</h3>
-                                <p style="color: #666; font-size: 13px; margin-top: 8px;">Supports MP4, MOV files</p>
+                                <p style="color: #666; font-size: 13px; margin-top: 8px;">Supports MP4, MOV from your Desktop</p>
                             </div>
                         </label>
                         <br>
@@ -162,7 +163,7 @@ HTML_CONTENT = """
                     <h3>💎 Already Paid? Activate PRO Key</h3>
                     <p style="color: #aaa; font-size: 13px; margin-bottom: 15px;">Agar aapne payment kardi hai, toh WhatsApp par mila hua secret code yahan enter karein:</p>
                     <div style="display: flex; gap: 10px; max-width: 400px; margin: auto;">
-                        <input type="text" id="promo-code" placeholder="Enter PRO Code..." style="margin-bottom: 0;">
+                        <input type="text" id="promo-code" placeholder="Enter PRO Code (e.g. SMOOTH-...)" style="margin-bottom: 0;">
                         <button onclick="activatePro()" class="btn" style="margin-top: 0; white-space: nowrap;">Activate</button>
                     </div>
                 </div>
@@ -171,9 +172,9 @@ HTML_CONTENT = """
                 <div class="guide-box">
                     <h3>📌 How to Use & Instructions:</h3>
                     <ul>
-                        <li><b>Upload:</b> Behtar performance ke liye apni video select karke upload karein.</li>
+                        <li><b>Desktop Upload:</b> Behtar performance aur heavy files ke liye hamesha apni video **Desktop** ya PC se select karke upload karein.</li>
                         <li><b>Free Credits:</b> Har naye user ko 2 videos bilkul free optimize karne ki sahulat milti hai.</li>
-                        <li><b>Quality:</b> Engine aapki video ko 1080x1920 resolution aur 60 FPS par top-tier quality mein render karta hai.</li>
+                        <li><b>Quality:</b> Engine aapki video ko 1080x1920 resolution aur 60 FPS par top-tier quality mein render karta hai jo TikTok par blur nahi hoti.</li>
                     </ul>
                 </div>
 
@@ -183,14 +184,17 @@ HTML_CONTENT = """
                     <p style="color: #aaa; font-size: 13px; margin-bottom: 15px;">Slider ko drag karke check karein: 1 taraf Laggy aur doosri taraf Smooth quality!</p>
                     
                     <div class="img-comparision-slider" id="comparison-slider">
+                        <!-- AFTER IMAGE (Smooth & Clear Gaming Setup) -->
                         <div class="badge-after">SMOOTH ⚡</div>
                         <img src="https://images.unsplash.com/photo-1542751371-adc38448a05e?w=800" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none;" alt="Smooth Gaming">
                         
+                        <!-- BEFORE IMAGE (Laggy / Blurred) -->
                         <div class="slider-image-wrapper" id="slider-wrapper">
                             <div class="badge-before">LAGGY 🚫</div>
                             <img src="https://images.unsplash.com/photo-1542751371-adc38448a05e?w=800" style="position: absolute; top: 0; left: 0; width: 600px; height: 100%; object-fit: cover; max-width: none; filter: blur(6px) grayscale(50%);" alt="Laggy Gaming">
                         </div>
                         
+                        <!-- SLIDER HANDLE BAR -->
                         <div class="slider-handle" id="slider-handle">
                             <div class="slider-handle-button">↔</div>
                         </div>
@@ -209,7 +213,7 @@ HTML_CONTENT = """
                     <label class="upload-box">
                         <input type="file" name="file" id="analyzer-file-input" required onchange="showFileName('analyzer-file-input', 'analyzer-upload-text', '📁 Video Selected for Analysis')">
                         <div id="analyzer-upload-text">
-                            <h3>📁 Upload video file to analyze specs</h3>
+                            <h3>📁 Upload video file from Desktop to analyze specs</h3>
                             <p style="color: #666; font-size: 13px; margin-top: 8px;">Get accurate specs of your specific video</p>
                         </div>
                     </label>
@@ -337,9 +341,11 @@ HTML_CONTENT = """
             window.open(`https://wa.me/923199628815?text=${encodedMsg}`, '_blank');
         }
 
+        // GAMING SLIDER LOGIC
         const slider = document.getElementById('comparison-slider');
         const sliderWrapper = document.getElementById('slider-wrapper');
         const sliderHandle = document.getElementById('slider-handle');
+
         let isDragging = false;
 
         function updateSlider(clientX) {
@@ -347,17 +353,39 @@ HTML_CONTENT = """
             let x = clientX - rect.left;
             if (x < 0) x = 0;
             if (x > rect.width) x = rect.width;
+            
             const percent = (x / rect.width) * 100;
             sliderWrapper.style.width = percent + '%';
             sliderHandle.style.left = percent + '%';
         }
 
-        slider.addEventListener('mousedown', (e) => { isDragging = true; updateSlider(e.clientX); });
-        window.addEventListener('mousemove', (e) => { if (!isDragging) return; updateSlider(e.clientX); });
-        window.addEventListener('mouseup', () => { isDragging = false; });
-        slider.addEventListener('touchstart', (e) => { isDragging = true; updateSlider(e.touches[0].clientX); });
-        window.addEventListener('touchmove', (e) => { if (!isDragging) return; updateSlider(e.touches[0].clientX); });
-        window.addEventListener('touchend', () => { isDragging = false; });
+        slider.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            updateSlider(e.clientX);
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            updateSlider(e.clientX);
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+
+        slider.addEventListener('touchstart', (e) => {
+            isDragging = true;
+            updateSlider(e.touches[0].clientX);
+        });
+
+        window.addEventListener('touchmove', (e) => {
+            if (!isDragging) return;
+            updateSlider(e.touches[0].clientX);
+        });
+
+        window.addEventListener('touchend', () => {
+            isDragging = false;
+        });
 
         async function analyzeVideo(event) {
             event.preventDefault();
@@ -424,8 +452,9 @@ HTML_CONTENT = """
                     progress += 1;
                     fill.style.width = progress + '%';
                     percentText.innerText = progress + '%';
+                    
                     if(progress > 20 && progress < 50) {
-                        statusText.innerText = "Applying high-end slow-mo filter...";
+                        statusText.innerText = "Applying Phantom high-end slow-mo filter...";
                     } else if(progress >= 50) {
                         statusText.innerText = "Rendering 60 FPS master quality...";
                     }
@@ -502,7 +531,7 @@ async def get_live_count():
 
 @app.middleware("http")
 async def track_visitors(request, call_next):
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    client_ip = request.client.host
     active_connections.add(client_ip)
     response = await call_next(request)
     return response
@@ -572,14 +601,13 @@ async def optimize_video(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File save nahi ho saki: {str(e)}")
 
-    # Render ki kam RAM ke liye 'ultrafast' preset use kiya hai taake 95% par hang na ho
     command = [
         FFMPEG_EXE,
         '-y',
         '-i', input_path,
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '20',
+        '-preset', 'slow',
+        '-crf', '16',
         '-pix_fmt', 'yuv420p',
         '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setpts=1.25*PTS',
         '-r', '60',
@@ -589,19 +617,21 @@ async def optimize_video(file: UploadFile = File(...)):
     ]
 
     try:
-        # Timeout 180 seconds taake server crash na ho
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"FFmpeg Error: {result.stderr[-300:]}")
-            
-        return {
-            "download_url": f"/api/download/{output_filename}",
-            "status": "success"
-        }
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Video processing timed out! File bohot bari hai.")
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0 # SW_HIDE
+
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, startupinfo=startupinfo)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
+        error_msg = getattr(e, 'stderr', str(e))
+        raise HTTPException(status_code=500, detail=f"FFmpeg Error: {error_msg}")
+
+    return {
+        "status": "success",
+        "download_url": f"/api/download/{output_filename}"
+    }
 
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
@@ -609,3 +639,9 @@ async def download_file(filename: str):
     if os.path.exists(file_path):
         return FileResponse(file_path, media_type="video/mp4", filename=filename)
     raise HTTPException(status_code=404, detail="File nahi mili")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+ 
+

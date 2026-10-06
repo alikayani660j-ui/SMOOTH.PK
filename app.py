@@ -1,657 +1,1479 @@
 import os
 import re
 import uuid
+import shutil
 import subprocess
-import glob
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import FileResponse, HTMLResponse
+import threading
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="smooth.pk - TikTok Video Optimizer")
+
+# =========================================================
+# APP
+# =========================================================
+
+app = FastAPI(title="SMOOTH.PK")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploads"
-OUTPUT_DIR = "outputs"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Real FFmpeg progress is stored here:
-# job_id -> 0..100, or -1 on error
+# =========================================================
+# DIRECTORIES
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+UPLOAD_DIR = BASE_DIR / "uploads"
+OUTPUT_DIR = BASE_DIR / "outputs"
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# FFMPEG DETECTION
+# =========================================================
+
+def find_program(name: str):
+    """
+    Works on Railway/Linux, Windows and Docker.
+    """
+
+    found = shutil.which(name)
+
+    if found:
+        return found
+
+    possible_paths = [
+        "/usr/bin/" + name,
+        "/usr/local/bin/" + name,
+        "/bin/" + name,
+        "/opt/render/project/.render/bin/" + name,
+        "/app/" + name,
+    ]
+
+    for path in possible_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    return None
+
+
+FFMPEG_EXE = find_program("ffmpeg")
+FFPROBE_EXE = find_program("ffprobe")
+
+
+# =========================================================
+# PROGRESS STORAGE
+# =========================================================
+
 progress_store = {}
 
-active_connections = set()
 
-desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-ffmpeg_search = glob.glob(
-    os.path.join(desktop_path, "**", "ffmpeg.exe"),
-    recursive=True
-)
-FFMPEG_EXE = ffmpeg_search[0] if ffmpeg_search else "ffmpeg"
+def set_progress(job_id, percent, status="processing", **extra):
+    progress_store[job_id] = {
+        "progress": max(0, min(100, int(percent))),
+        "status": status,
+        **extra
+    }
 
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def safe_filename(filename: str):
+    """
+    Removes unsafe characters from uploaded filenames.
+    """
+
+    filename = filename or "video.mp4"
+
+    filename = Path(filename).name
+
+    filename = re.sub(
+        r"[^a-zA-Z0-9._-]",
+        "_",
+        filename
+    )
+
+    if not filename:
+        filename = "video.mp4"
+
+    return filename
+
+
+def get_duration(file_path: str):
+    """
+    Get video duration using ffprobe.
+    """
+
+    if not FFPROBE_EXE:
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_EXE,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                file_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+
+        value = result.stdout.strip()
+
+        if value:
+            duration = float(value)
+
+            if duration > 0:
+                return duration
+
+    except Exception as e:
+        print("FFPROBE ERROR:", repr(e))
+
+    return None
+
+
+# =========================================================
+# HOME PAGE
+# =========================================================
 
 HTML_CONTENT = r"""
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>smooth.pk - TikTok Video Optimizer</title>
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>SMOOTH.PK - TikTok Video Optimizer</title>
+
 <style>
-*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',Tahoma,sans-serif}
-body{background:#0c0c0e;color:#fff;line-height:1.6}
-header{display:flex;justify-content:space-between;align-items:center;padding:20px 50px;background:#121216;border-bottom:1px solid #222;position:sticky;top:0;z-index:1000}
-.logo{font-size:24px;font-weight:bold;color:#00ffcc;letter-spacing:1px}
-nav a{color:#aaa;text-decoration:none;margin-left:20px;font-size:14px;cursor:pointer}
-nav a:hover,nav a.active{color:#00ffcc}
-.live-badge{background:rgba(0,255,204,.1);border:1px solid #00ffcc;padding:5px 12px;border-radius:20px;font-size:13px;color:#00ffcc;display:flex;align-items:center;gap:6px}
-.live-dot{width:8px;height:8px;background:#00ffcc;border-radius:50%;animation:pulse 1.5s infinite}
-@keyframes pulse{0%{opacity:1}50%{opacity:.3}100%{opacity:1}}
-.container{max-width:1000px;margin:40px auto;padding:20px;text-align:center}
-.section{display:none}.section.active{display:block}
-h1{font-size:42px;margin-bottom:15px;font-weight:800}
-p.sub{color:#aaa;margin-bottom:30px;font-size:16px}
-.card{background:#16161a;border:1px solid #26262f;border-radius:16px;padding:40px;margin-bottom:30px;box-shadow:0 10px 30px rgba(0,0,0,.5);text-align:left}
-.center-card{text-align:center}
-.upload-box{border:2px dashed #333;padding:40px;border-radius:12px;cursor:pointer;transition:.3s;background:#121215;display:block;text-align:center}
-.upload-box:hover{border-color:#00ffcc}
-input[type=file]{display:none}
-input[type=text],textarea{width:100%;padding:14px;background:#121215;border:1px solid #333;color:#fff;border-radius:8px;font-size:16px;margin-bottom:15px;outline:none}
-.btn{background:#00ffcc;color:#000;padding:12px 30px;font-weight:bold;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-top:15px;display:inline-block;text-decoration:none;text-align:center}
-.btn:hover{background:#00cca3}
-.btn:disabled{opacity:.6;cursor:not-allowed}
-.free-badge{background:rgba(0,255,204,.15);border:1px solid #00ffcc;color:#00ffcc;padding:8px 16px;border-radius:8px;font-size:14px;margin-bottom:20px;display:inline-block;font-weight:bold}
-.guide-box{background:#121215;border:1px solid #222;padding:20px;border-radius:10px;margin-top:20px;font-size:14px;color:#ccc}
-.guide-box h3{color:#00ffcc;margin-bottom:10px}.guide-box ul{padding-left:20px}.guide-box li{margin-bottom:8px}
-.preview-container{margin-top:25px;background:#121215;border:1px solid #222;padding:20px;border-radius:12px;text-align:center}
-.img-comparision-slider{position:relative;width:100%;max-width:600px;height:350px;margin:20px auto;overflow:hidden;border-radius:8px;border:1px solid #333;user-select:none}
-.slider-image-wrapper{position:absolute;top:0;left:0;width:50%;height:100%;overflow:hidden;z-index:2}
-.slider-handle{position:absolute;top:0;bottom:0;left:50%;width:4px;background:#00ffcc;z-index:3;cursor:ew-resize}
-.slider-handle-button{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:36px;height:36px;background:#00ffcc;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#000;font-weight:bold}
-.badge-before,.badge-after{position:absolute;top:15px;background:rgba(0,0,0,.8);padding:4px 10px;border-radius:4px;font-size:12px;font-weight:bold;z-index:4}
-.badge-before{left:15px;color:#ff4d4d}.badge-after{right:15px;color:#00ffcc}
-.complaint-section,.activate-section{margin-top:30px;background:#16161a;border:1px solid #26262f;border-radius:16px;padding:30px;text-align:left}
-.activate-section{border-color:#00ffcc;text-align:center}.activate-section h3,.complaint-section h3{color:#00ffcc;margin-bottom:10px;font-size:20px}
-.pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;margin-top:30px}
-.price-card{background:#16161a;border:1px solid #26262f;border-radius:16px;padding:30px;text-align:left}
-.price-card h3{font-size:18px;color:#888;margin-bottom:10px}.price-card .price{font-size:48px;font-weight:bold;margin-bottom:20px}
-.price-card ul{list-style:none;margin-bottom:25px}.price-card ul li{margin-bottom:10px;color:#ccc;font-size:14px}
-.price-card ul li::before{content:"✓ ";color:#00ffcc;font-weight:bold}
-.result-box{margin-top:20px;background:#121215;padding:20px;border-radius:10px;text-align:left;border:1px solid #222;display:none}
-#progress-overlay{display:none;text-align:center;padding:30px}
-.loader-bar{width:100%;background:#222;border-radius:10px;height:12px;overflow:hidden;margin:20px 0}
-.loader-fill{width:0%;height:100%;background:#00ffcc;transition:width .25s ease}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+
+    font-family:
+        Arial,
+        Helvetica,
+        sans-serif;
+
+    background:
+        linear-gradient(
+            135deg,
+            #090909,
+            #151515,
+            #080808
+        );
+
+    color: white;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    padding: 20px;
+}
+
+.container {
+    width: 100%;
+    max-width: 650px;
+
+    background: rgba(25,25,25,0.96);
+
+    border: 1px solid #292929;
+
+    border-radius: 24px;
+
+    padding: 30px;
+
+    box-shadow:
+        0 20px 60px rgba(0,0,0,0.45);
+}
+
+.logo {
+    text-align: center;
+
+    font-size: 38px;
+
+    font-weight: 900;
+
+    margin-bottom: 5px;
+}
+
+.logo span {
+    color: #ff0050;
+}
+
+.subtitle {
+    text-align: center;
+
+    color: #aaa;
+
+    margin-bottom: 30px;
+}
+
+.upload-box {
+    border: 2px dashed #444;
+
+    border-radius: 18px;
+
+    padding: 35px 20px;
+
+    text-align: center;
+
+    cursor: pointer;
+
+    transition: 0.2s;
+}
+
+.upload-box:hover {
+    border-color: #ff0050;
+    background: rgba(255,0,80,0.04);
+}
+
+.upload-icon {
+    font-size: 48px;
+    margin-bottom: 10px;
+}
+
+input[type=file] {
+    display: none;
+}
+
+.file-name {
+    margin-top: 15px;
+
+    color: #bbb;
+
+    word-break: break-word;
+}
+
+button {
+    width: 100%;
+
+    margin-top: 20px;
+
+    border: none;
+
+    border-radius: 13px;
+
+    padding: 15px;
+
+    background: #ff0050;
+
+    color: white;
+
+    font-size: 17px;
+
+    font-weight: bold;
+
+    cursor: pointer;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.progress-container {
+    display: none;
+
+    margin-top: 25px;
+}
+
+.progress-top {
+    display: flex;
+
+    justify-content: space-between;
+
+    margin-bottom: 9px;
+
+    color: #ccc;
+}
+
+.progress-bar {
+    width: 100%;
+
+    height: 14px;
+
+    background: #2b2b2b;
+
+    border-radius: 20px;
+
+    overflow: hidden;
+}
+
+.progress-fill {
+    height: 100%;
+
+    width: 0%;
+
+    background:
+        linear-gradient(
+            90deg,
+            #ff0050,
+            #ff336f
+        );
+
+    border-radius: 20px;
+
+    transition: width 0.25s linear;
+}
+
+.status {
+    text-align: center;
+
+    margin-top: 15px;
+
+    color: #aaa;
+
+    font-size: 14px;
+}
+
+.result {
+    display: none;
+
+    margin-top: 25px;
+
+    text-align: center;
+
+    padding: 20px;
+
+    background: #151515;
+
+    border-radius: 15px;
+}
+
+.download-btn {
+    display: block;
+
+    text-decoration: none;
+
+    margin-top: 15px;
+
+    background: #20c997;
+
+    color: white;
+
+    padding: 13px;
+
+    border-radius: 12px;
+
+    font-weight: bold;
+}
+
+.error {
+    color: #ff5c75;
+}
+
+.success {
+    color: #20c997;
+}
+
 </style>
+
 </head>
 
 <body>
-<header>
-<div class="logo">smooth.pk</div>
-<nav>
-<a onclick="switchTab('optimizer')" id="nav-optimizer" class="active">Optimizer</a>
-<a onclick="switchTab('analyzer')" id="nav-analyzer">Video Analyzer</a>
-<a onclick="switchTab('pricing')" id="nav-pricing">PRO Plans</a>
-</nav>
-<div class="live-badge"><div class="live-dot"></div><span id="live-count">1</span> Live</div>
-</header>
 
 <div class="container">
 
-<div id="optimizer" class="section active">
-<h1>TIKTOK VIDEO OPTIMIZER</h1>
-<p class="sub">Optimize your video while preserving high-end quality.</p>
+    <div class="logo">
+        SMOOTH<span>.PK</span>
+    </div>
 
-<div class="center-card free-badge" id="status-badge">
-🎁 Special Offer: Pehle 2 videos bilkul FREE! (<span id="free-left">2</span> free credits left)
-</div>
+    <div class="subtitle">
+        TikTok Video Optimizer
+    </div>
 
-<div class="card center-card">
-<form id="upload-form" onsubmit="uploadVideo(event)">
-<div id="form-content">
-<label class="upload-box" id="drop-zone">
-<input type="file" name="file" id="file-input" required onchange="showFileName('file-input','upload-text')">
-<div id="upload-text">
-<h3>📁 Drop your video here or click to browse</h3>
-<p style="color:#666;font-size:13px;margin-top:8px">Supports MP4, MOV</p>
-</div>
-</label>
-<br>
-<button type="submit" class="btn" id="submit-btn">⚡ Optimize Video Now</button>
-</div>
 
-<div id="progress-overlay">
-<h3 style="color:#00ffcc;margin-bottom:10px">⚡ Optimizing Video Quality...</h3>
-<p id="progress-status-text" style="color:#aaa;font-size:14px">Preparing video...</p>
-<div class="loader-bar"><div class="loader-fill" id="loader-fill"></div></div>
-<h2 id="progress-percent" style="color:#fff;font-size:28px">0%</h2>
-<p style="color:#777;font-size:12px;margin-top:8px">
-Real FFmpeg rendering progress — 95% par fake lock nahi hai.
-</p>
-</div>
-</form>
+    <label
+        class="upload-box"
+        for="videoInput"
+    >
 
-<div class="activate-section">
-<h3>💎 Already Paid? Activate PRO Key</h3>
-<p style="color:#aaa;font-size:13px;margin-bottom:15px">WhatsApp par mila PRO code enter karein:</p>
-<div style="display:flex;gap:10px;max-width:400px;margin:auto">
-<input type="text" id="promo-code" placeholder="Enter PRO Code" style="margin-bottom:0">
-<button onclick="activatePro()" class="btn" style="margin-top:0">Activate</button>
-</div>
-</div>
+        <div class="upload-icon">
+            🎬
+        </div>
 
-<div class="guide-box">
-<h3>📌 How to Use</h3>
-<ul>
-<li>Video select karein aur Optimize Video Now dabayein.</li>
-<li>Progress bar FFmpeg ki REAL rendering progress show karegi.</li>
-<li>100% sirf video successfully render hone ke baad aayega.</li>
-</ul>
-</div>
+        <div>
+            Select your video
+        </div>
 
-<div class="preview-container">
-<h3 style="color:#00ffcc">🔥 Gaming Before & After Slider</h3>
-<div class="img-comparision-slider" id="comparison-slider">
-<div class="badge-after">SMOOTH ⚡</div>
-<img src="https://images.unsplash.com/photo-1542751371-adc38448a05e?w=800" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover">
-<div class="slider-image-wrapper" id="slider-wrapper">
-<div class="badge-before">LAGGY 🚫</div>
-<img src="https://images.unsplash.com/photo-1542751371-adc38448a05e?w=800" style="position:absolute;top:0;left:0;width:600px;height:100%;object-fit:cover;max-width:none;filter:blur(6px) grayscale(50%)">
-</div>
-<div class="slider-handle" id="slider-handle"><div class="slider-handle-button">↔</div></div>
-</div>
-</div>
-</div>
-</div>
+        <div class="file-name" id="fileName">
+            MP4, MOV, AVI and other video files
+        </div>
 
-<div id="analyzer" class="section">
-<h1>REAL VIDEO ANALYZER</h1>
-<p class="sub">Check resolution, FPS, codec and bitrate.</p>
-<div class="card center-card">
-<form id="analyzer-form" onsubmit="analyzeVideo(event)">
-<label class="upload-box">
-<input type="file" id="analyzer-file-input" required onchange="showFileName('analyzer-file-input','analyzer-upload-text')">
-<div id="analyzer-upload-text"><h3>📁 Upload video to analyze</h3></div>
-</label>
-<br>
-<button type="submit" class="btn" id="analyzer-btn">📊 Analyze Real Specs</button>
-</form>
-<div id="analyzer-result" class="result-box">
-<h3 style="color:#00ffcc;margin-bottom:10px">📊 Real Video Analysis</h3>
-<div id="analysis-content" style="color:#ccc;line-height:1.8"></div>
-</div>
-</div>
-</div>
+    </label>
 
-<div id="pricing" class="section">
-<h1>GO PRO</h1>
-<p class="sub">Unlock unlimited optimizations.</p>
-<div class="pricing-grid">
-<div class="price-card"><h3>1 MONTH</h3><div class="price">$1</div>
-<ul><li>30 Days Access</li><li>Unlimited optimizations</li><li>Larger uploads</li></ul>
-<a href="https://wa.me/923199628815?text=Hi%20Ali,%20I%20want%20to%20buy%201%20Month%20PRO%20Access%20for%20$1" target="_blank" class="btn" style="width:100%">Get via WhatsApp ($1)</a></div>
-<div class="price-card" style="border-color:#00ffcc"><h3>5 MONTHS</h3><div class="price">$5</div>
-<ul><li>5 Months Access</li><li>Unlimited optimizations</li><li>Priority processing</li></ul>
-<a href="https://wa.me/923199628815?text=Hi%20Ali,%20I%20want%20to%20buy%205%20Months%20PRO%20Access%20for%20$5" target="_blank" class="btn" style="width:100%">Get via WhatsApp ($5)</a></div>
-<div class="price-card"><h3>UNLIMITED LIFETIME</h3><div class="price">$20</div>
-<ul><li>Lifetime Access</li><li>Unlimited optimizations</li><li>VIP Support</li></ul>
-<a href="https://instagram.com/alikayani09" target="_blank" class="btn" style="width:100%">Get via Instagram ($20)</a></div>
-</div>
-</div>
 
-<div class="complaint-section">
-<h3>🛠️ Koi Bhi Masla Ho?</h3>
-<p style="color:#aaa;font-size:13px;margin-bottom:15px">Apna masla likhein aur WhatsApp par send karein:</p>
-<textarea id="complaint-text" rows="3" placeholder="Apna masla yahan type karein..."></textarea>
-<button onclick="sendComplaint()" class="btn">💬 Send Complaint via WhatsApp</button>
-</div>
+    <input
+        id="videoInput"
+        type="file"
+        accept="video/*"
+    >
+
+
+    <button
+        id="processBtn"
+        onclick="startProcessing()"
+        disabled
+    >
+        Optimize Video
+    </button>
+
+
+    <div
+        class="progress-container"
+        id="progressContainer"
+    >
+
+        <div class="progress-top">
+
+            <span id="progressText">
+                0%
+            </span>
+
+            <span id="statusText">
+                Starting...
+            </span>
+
+        </div>
+
+
+        <div class="progress-bar">
+
+            <div
+                class="progress-fill"
+                id="progressFill"
+            ></div>
+
+        </div>
+
+
+        <div
+            class="status"
+            id="status"
+        >
+            Preparing video...
+        </div>
+
+    </div>
+
+
+    <div
+        class="result"
+        id="result"
+    >
+
+        <div
+            class="success"
+            style="font-size:20px;font-weight:bold;"
+        >
+            ✅ Video Ready
+        </div>
+
+        <a
+            id="downloadBtn"
+            class="download-btn"
+            href="#"
+        >
+            Download Optimized Video
+        </a>
+
+    </div>
 
 </div>
+
 
 <script>
-let isPro = localStorage.getItem('smooth_is_pro') === 'true';
-let freeCredits = parseInt(localStorage.getItem('smooth_free_credits') || '2');
 
-function updateUIStatus(){
-if(isPro){
-document.getElementById('status-badge').innerHTML='🔥 PRO ACCOUNT ACTIVE: Unlimited optimizations!';
-}else{
-document.getElementById('free-left').innerText=freeCredits;
-}
-}
-updateUIStatus();
+let selectedFile = null;
 
-function activatePro(){
-const code=document.getElementById('promo-code').value.trim();
-const validCodes=["SMOOTH-1M-786","SMOOTH-5M-992","SMOOTH-LIFE-2026"];
-if(validCodes.includes(code)){
-localStorage.setItem('smooth_is_pro','true');
-isPro=true; updateUIStatus();
-alert('🎉 Mubarak ho! PRO successfully activated.');
-}else alert('❌ Ghalat code!');
-}
+let currentJobId = null;
 
-function switchTab(tabId){
-document.querySelectorAll('.section').forEach(x=>x.classList.remove('active'));
-document.querySelectorAll('nav a').forEach(x=>x.classList.remove('active'));
-document.getElementById(tabId).classList.add('active');
-document.getElementById('nav-'+tabId).classList.add('active');
-}
+let progressTimer = null;
 
-function showFileName(inputId,textId){
-const input=document.getElementById(inputId);
-const text=document.getElementById(textId);
-if(input.files.length>0)
-text.innerHTML='<h3 style="color:#00ffcc">✅ Selected: '+input.files[0].name+'</h3>';
-}
 
-function sendComplaint(){
-const msg=document.getElementById('complaint-text').value.trim();
-if(!msg){alert('Pehle complaint likhein!');return;}
-window.open('https://wa.me/923199628815?text='+encodeURIComponent('Complaint / Issue: '+msg),'_blank');
-}
+const videoInput =
+    document.getElementById("videoInput");
 
-// Slider
-const slider=document.getElementById('comparison-slider');
-const wrapper=document.getElementById('slider-wrapper');
-const handle=document.getElementById('slider-handle');
-let dragging=false;
+const fileName =
+    document.getElementById("fileName");
 
-function updateSlider(clientX){
-const rect=slider.getBoundingClientRect();
-let x=Math.max(0,Math.min(rect.width,clientX-rect.left));
-let p=(x/rect.width)*100;
-wrapper.style.width=p+'%';
-handle.style.left=p+'%';
-}
-slider.addEventListener('mousedown',e=>{dragging=true;updateSlider(e.clientX)});
-window.addEventListener('mousemove',e=>{if(dragging)updateSlider(e.clientX)});
-window.addEventListener('mouseup',()=>dragging=false);
-slider.addEventListener('touchstart',e=>{dragging=true;updateSlider(e.touches[0].clientX)});
-window.addEventListener('touchmove',e=>{if(dragging)updateSlider(e.touches[0].clientX)});
-window.addEventListener('touchend',()=>dragging=false);
+const processBtn =
+    document.getElementById("processBtn");
 
-// Analyzer
-async function analyzeVideo(event){
-event.preventDefault();
-const input=document.getElementById('analyzer-file-input');
-if(!input.files.length)return;
-const btn=document.getElementById('analyzer-btn');
-btn.disabled=true;btn.innerText='⏳ Reading metadata...';
-const fd=new FormData();fd.append('file',input.files[0]);
-try{
-const response=await fetch('/api/analyze',{method:'POST',body:fd});
-const data=await response.json();
-const box=document.getElementById('analyzer-result');
-const content=document.getElementById('analysis-content');
-box.style.display='block';
-if(response.ok){
-content.innerHTML='• <b>Filename:</b> '+data.filename+
-'<br>• <b>Resolution:</b> <span style="color:#00ffcc">'+data.width+'x'+data.height+
-'</span><br>• <b>Frame Rate:</b> '+data.fps+
-'<br>• <b>Codec:</b> '+data.codec+
-'<br>• <b>Bitrate:</b> '+data.bitrate+
-'<br>• <b>Status:</b> <span style="color:#00ffcc">'+data.status_msg+'</span>';
-}else content.innerHTML='<span style="color:#ff4d4d">Error: '+(data.detail||'Analysis failed')+'</span>';
-}catch(e){alert('Error connecting to server.')}
-finally{btn.disabled=false;btn.innerText='📊 Analyze Real Specs'}
-}
+const progressContainer =
+    document.getElementById("progressContainer");
 
-// IMPORTANT: REAL FFmpeg progress
-async function uploadVideo(event){
-event.preventDefault();
+const progressFill =
+    document.getElementById("progressFill");
 
-let credits=parseInt(localStorage.getItem('smooth_free_credits')||'0');
-if(!isPro && credits<=0){
-alert('Aapke free credits khatam ho chuke hain!');
-switchTab('pricing');return;
-}
+const progressText =
+    document.getElementById("progressText");
 
-const input=document.getElementById('file-input');
-if(!input.files.length)return;
+const statusText =
+    document.getElementById("statusText");
 
-document.getElementById('form-content').style.display='none';
-document.getElementById('progress-overlay').style.display='block';
+const status =
+    document.getElementById("status");
 
-const fill=document.getElementById('loader-fill');
-const percentText=document.getElementById('progress-percent');
-const statusText=document.getElementById('progress-status-text');
+const result =
+    document.getElementById("result");
 
-const jobId=Date.now()+'-'+Math.random().toString(36).slice(2);
-const fd=new FormData();
-fd.append('file',input.files[0]);
-fd.append('job_id',jobId);
+const downloadBtn =
+    document.getElementById("downloadBtn");
 
-let finished=false;
 
-const progressTimer=setInterval(async()=>{
-if(finished)return;
-try{
-const r=await fetch('/api/progress/'+encodeURIComponent(jobId));
-const d=await r.json();
-const p=Number(d.progress||0);
+videoInput.addEventListener(
+    "change",
+    function() {
 
-if(p>=0){
-fill.style.width=p+'%';
-percentText.innerText=p+'%';
+        if (!this.files.length) {
+            selectedFile = null;
 
-if(p<10)statusText.innerText='Preparing video...';
-else if(p<30)statusText.innerText='Processing video...';
-else if(p<60)statusText.innerText='Rendering high quality...';
-else if(p<90)statusText.innerText='Rendering 1080x1920 60FPS...';
-else if(p<100)statusText.innerText='Finishing video...';
-}
-}catch(e){}
-},500);
+            fileName.textContent =
+                "MP4, MOV, AVI and other video files";
 
-try{
-const response=await fetch('/api/optimize',{method:'POST',body:fd});
-const data=await response.json();
+            processBtn.disabled = true;
 
-finished=true;
-clearInterval(progressTimer);
+            return;
+        }
 
-if(!response.ok)throw new Error(data.detail||'Optimization failed');
 
-fill.style.width='100%';
-percentText.innerText='100%';
-statusText.innerText='Optimization Complete!';
+        selectedFile = this.files[0];
 
-if(!isPro && credits>0){
-credits--;
-localStorage.setItem('smooth_free_credits',credits);
-document.getElementById('free-left').innerText=credits;
+        fileName.textContent =
+            selectedFile.name;
+
+        processBtn.disabled = false;
+
+        result.style.display = "none";
+
+    }
+);
+
+
+async function startProcessing() {
+
+    if (!selectedFile) {
+        return;
+    }
+
+
+    processBtn.disabled = true;
+
+    progressContainer.style.display = "block";
+
+    result.style.display = "none";
+
+
+    setProgressUI(
+        0,
+        "Uploading..."
+    );
+
+
+    const formData =
+        new FormData();
+
+    formData.append(
+        "file",
+        selectedFile
+    );
+
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/optimize",
+                {
+                    method: "POST",
+                    body: formData
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.detail ||
+                "Video processing failed."
+            );
+
+        }
+
+
+        currentJobId =
+            data.job_id;
+
+
+        startProgressPolling();
+
+    }
+
+    catch (error) {
+
+        showError(
+            error.message
+        );
+
+        processBtn.disabled = false;
+
+    }
+
 }
 
-setTimeout(()=>{
-document.body.innerHTML='<div style="background:#0c0c0e;color:#fff;font-family:Segoe UI,sans-serif;text-align:center;padding-top:100px"><div style="background:#16161a;border:1px solid #26262f;max-width:500px;margin:auto;padding:40px;border-radius:16px"><h1 style="color:#00ffcc;margin-bottom:20px">🎉 Video Optimized Successfully!</h1><p style="color:#aaa;margin-bottom:30px">Aapki video optimize ho chuki hai.</p><a href="'+data.download_url+'" download class="btn">📥 Download Optimized Video</a><br><br><a href="/" style="color:#888;text-decoration:none">← Back to Optimizer</a></div></div>';
-},500);
 
-}catch(err){
-finished=true;
-clearInterval(progressTimer);
-alert('❌ Processing Error: '+err.message);
-document.getElementById('form-content').style.display='block';
-document.getElementById('progress-overlay').style.display='none';
-}
+function startProgressPolling() {
+
+    if (progressTimer) {
+        clearInterval(progressTimer);
+    }
+
+
+    progressTimer =
+        setInterval(
+            checkProgress,
+            500
+        );
+
+
+    checkProgress();
+
 }
 
-async function updateLiveUsers(){
-try{
-const r=await fetch('/api/live-count');
-const d=await r.json();
-document.getElementById('live-count').innerText=d.count;
-}catch(e){}
+
+async function checkProgress() {
+
+    if (!currentJobId) {
+        return;
+    }
+
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/progress/" +
+                currentJobId
+            );
+
+
+        const data =
+            await response.json();
+
+
+        const percent =
+            Number(data.progress || 0);
+
+
+        setProgressUI(
+            percent,
+            data.status_text ||
+            "Processing..."
+        );
+
+
+        if (
+            data.status === "completed"
+        ) {
+
+            clearInterval(
+                progressTimer
+            );
+
+            progressTimer = null;
+
+
+            setProgressUI(
+                100,
+                "Complete!"
+            );
+
+
+            downloadBtn.href =
+                data.download_url;
+
+
+            result.style.display =
+                "block";
+
+
+            processBtn.disabled =
+                false;
+
+        }
+
+
+        if (
+            data.status === "error"
+        ) {
+
+            clearInterval(
+                progressTimer
+            );
+
+            progressTimer = null;
+
+
+            showError(
+                data.error ||
+                "FFmpeg video processing failed."
+            );
+
+
+            processBtn.disabled =
+                false;
+
+        }
+
+    }
+
+    catch (error) {
+
+        console.log(
+            "Progress error:",
+            error
+        );
+
+    }
+
 }
-setInterval(updateLiveUsers,3000);
-updateLiveUsers();
+
+
+function setProgressUI(
+    percent,
+    text
+) {
+
+    percent =
+        Math.max(
+            0,
+            Math.min(
+                100,
+                Math.round(percent)
+            )
+        );
+
+
+    progressFill.style.width =
+        percent + "%";
+
+
+    progressText.textContent =
+        percent + "%";
+
+
+    statusText.textContent =
+        text;
+
+
+    status.textContent =
+        text;
+
+}
+
+
+function showError(message) {
+
+    progressContainer.style.display =
+        "block";
+
+
+    status.innerHTML =
+        '<span class="error">❌ ' +
+        escapeHtml(message) +
+        '</span>';
+
+
+    statusText.textContent =
+        "Error";
+
+
+    progressText.textContent =
+        "0%";
+
+
+    progressFill.style.width =
+        "0%";
+
+}
+
+
+function escapeHtml(text) {
+
+    const div =
+        document.createElement("div");
+
+    div.textContent =
+        text;
+
+    return div.innerHTML;
+
+}
+
 </script>
+
 </body>
+
 </html>
 """
 
 
+# =========================================================
+# HOME ROUTE
+# =========================================================
+
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
+def home():
     return HTML_CONTENT
 
 
-@app.get("/api/live-count")
-async def get_live_count():
-    return {"count": max(1, len(active_connections))}
+# =========================================================
+# HEALTH CHECK
+# =========================================================
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "ffmpeg": FFMPEG_EXE or "NOT FOUND",
+        "ffprobe": FFPROBE_EXE or "NOT FOUND"
+    }
 
 
-@app.middleware("http")
-async def track_visitors(request, call_next):
-    client_ip = request.client.host
-    active_connections.add(client_ip)
-    return await call_next(request)
-
-
-@app.post("/api/analyze")
-async def analyze_video_specs(file: UploadFile = File(...)):
-    safe_name = os.path.basename(file.filename)
-    temp_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4().hex}_{safe_name}")
-
-    try:
-        with open(temp_path, "wb") as buffer:
-            buffer.write(await file.read())
-
-        cmd = [FFMPEG_EXE, "-i", temp_path]
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        output_text = result.stderr
-
-        width, height = 1080, 1920
-        fps = "Unknown"
-        codec = "Unknown"
-        bitrate = "Unknown"
-
-        for line in output_text.splitlines():
-            if "Stream" in line and "Video" in line:
-                parts = line.split(",")
-
-                for p in parts:
-                    p = p.strip()
-
-                    m = re.search(r"(\d{2,5})x(\d{2,5})", p)
-                    if m:
-                        width = int(m.group(1))
-                        height = int(m.group(2))
-
-                    if "fps" in p or "tbr" in p:
-                        fps = p
-
-                    for c in ["h264", "hevc", "vp9", "av1", "mpeg4"]:
-                        if c in p.lower():
-                            codec = c
-                            break
-
-            if "bitrate:" in line.lower():
-                try:
-                    bitrate = line.lower().split("bitrate:")[1].strip().split()[0] + " kbps"
-                except Exception:
-                    pass
-
-        return {
-            "filename": file.filename,
-            "width": width,
-            "height": height,
-            "fps": fps,
-            "codec": codec,
-            "bitrate": bitrate,
-            "status_msg": "Real specs extracted successfully!"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis Error: {str(e)}")
-
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
+# =========================================================
+# OPTIMIZATION
+# =========================================================
 
 @app.post("/api/optimize")
-def optimize_video(
-    file: UploadFile = File(...),
-    job_id: str = Form(...)
-):
-    # Unique/safe filenames prevent clashes when two users upload
-    # files with the same name.
-    original_name = os.path.basename(file.filename)
-    unique_name = f"{uuid.uuid4().hex}_{original_name}"
+def optimize_video(file: UploadFile = File(...)):
 
-    input_path = os.path.join(UPLOAD_DIR, unique_name)
-    output_filename = f"optimized_{unique_name}"
-    output_path = os.path.join(OUTPUT_DIR, output_filename)
+    if not FFMPEG_EXE:
+        raise HTTPException(
+            status_code=500,
+            detail="FFmpeg is not installed on the server."
+        )
 
-    progress_store[job_id] = 0
+
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="No video file selected."
+        )
+
+
+    job_id =
+        str(uuid.uuid4())
+
+
+    original_name =
+        safe_filename(file.filename)
+
+
+    input_path =
+        UPLOAD_DIR / (
+            job_id + "_" + original_name
+        )
+
+
+    output_path =
+        OUTPUT_DIR / (
+            job_id + "_optimized.mp4"
+        )
+
 
     try:
-        with open(input_path, "wb") as buffer:
-            buffer.write(file.file.read())
 
-        # Get exact duration first.
-        probe = subprocess.run(
-            [FFMPEG_EXE, "-i", input_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True
+        with open(
+            input_path,
+            "wb"
+        ) as buffer:
+
+            while True:
+
+                chunk =
+                    file.file.read(
+                        1024 * 1024
+                    )
+
+                if not chunk:
+                    break
+
+                buffer.write(chunk)
+
+
+    except Exception as e:
+
+        print(
+            "UPLOAD ERROR:",
+            repr(e)
         )
 
-        duration = 0.0
-        match = re.search(
-            r"Duration:\s*(\d+):(\d+):([\d.]+)",
-            probe.stderr
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save uploaded video."
         )
 
-        if match:
-            duration = (
-                int(match.group(1)) * 3600
-                + int(match.group(2)) * 60
-                + float(match.group(3))
+
+    progress_store[job_id] = {
+        "progress": 1,
+        "status": "processing",
+        "status_text": "Reading video..."
+    }
+
+
+    thread =
+        threading.Thread(
+            target=run_ffmpeg,
+            args=(
+                job_id,
+                str(input_path),
+                str(output_path),
+            ),
+            daemon=True
+        )
+
+
+    thread.start()
+
+
+    return {
+        "job_id": job_id
+    }
+
+
+# =========================================================
+# FFMPEG WORKER
+# =========================================================
+
+def run_ffmpeg(
+    job_id,
+    input_path,
+    output_path
+):
+
+    try:
+
+        duration =
+            get_duration(
+                input_path
             )
 
-        if duration <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Video duration read nahi ho saki."
+
+        if not duration:
+
+            print(
+                "WARNING: Could not detect duration."
             )
+
+
+        set_progress(
+            job_id,
+            1,
+            "processing",
+            status_text="Starting FFmpeg..."
+        )
+
+
+        # -------------------------------------------------
+        # RAILWAY-FRIENDLY ENCODING
+        # -------------------------------------------------
+        #
+        # veryfast = much less CPU than slow
+        #
+        # CRF 20 = good quality
+        #
+        # Do NOT force 60fps.
+        # This prevents unnecessary CPU usage.
+        #
+        # Scale to max 1080x1920 while keeping aspect ratio.
+        #
 
         command = [
-            FFMPEG_EXE,
-            "-y",
-            "-i", input_path,
 
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
+            FFMPEG_EXE,
+
+            "-y",
+
+            "-hide_banner",
+
+            "-i",
+            input_path,
+
+            "-map",
+            "0:v:0",
+
+            "-map",
+            "0:a:0?",
 
             "-vf",
-            "scale=1080:1920:force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            (
+                "scale="
+                "1080:1920:"
+                "force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:"
+                "(ow-iw)/2:"
+                "(oh-ih)/2"
+            ),
 
-            "-r", "60",
+            "-c:v",
+            "libx264",
 
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-preset",
+            "veryfast",
 
-            "-movflags", "+faststart",
+            "-crf",
+            "20",
 
-            # REAL FFmpeg progress:
-            "-progress", "pipe:1",
+            "-pix_fmt",
+            "yuv420p",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "128k",
+
+            "-movflags",
+            "+faststart",
+
+            "-progress",
+            "pipe:1",
+
             "-nostats",
 
             output_path
         ]
 
-        startupinfo = None
 
-        if os.name == "nt":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = 0
+        print("")
+        print("========================================")
+        print("FFMPEG START")
+        print("JOB:", job_id)
+        print("FFMPEG:", FFMPEG_EXE)
+        print("FFPROBE:", FFPROBE_EXE)
+        print("DURATION:", duration)
+        print("COMMAND:")
+        print(" ".join(command))
+        print("========================================")
+        print("")
 
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            startupinfo=startupinfo,
-            bufsize=1
-        )
 
-        # FFmpeg writes out_time_ms while rendering.
-        # Convert that actual timestamp into an actual percentage.
-        for line in process.stdout:
-            line = line.strip()
+        process =
+            subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
 
-            if line.startswith("out_time_ms="):
+
+        stderr_lines = []
+
+
+        def read_stderr():
+
+            try:
+
+                for line in process.stderr:
+
+                    line =
+                        line.strip()
+
+                    if line:
+
+                        stderr_lines.append(
+                            line
+                        )
+
+                        print(
+                            "FFMPEG:",
+                            line
+                        )
+
+            except Exception as e:
+
+                print(
+                    "STDERR READ ERROR:",
+                    repr(e)
+                )
+
+
+        stderr_thread =
+            threading.Thread(
+                target=read_stderr,
+                daemon=True
+            )
+
+        stderr_thread.start()
+
+
+        last_percent = 1
+
+
+        while True:
+
+            line =
+                process.stdout.readline()
+
+
+            if not line:
+
+                if process.poll() is not None:
+                    break
+
+                continue
+
+
+            line =
+                line.strip()
+
+
+            if line.startswith(
+                "out_time_ms="
+            ):
+
                 try:
-                    current_time = int(
-                        line.split("=", 1)[1]
-                    ) / 1_000_000
 
-                    percent = int(
-                        (current_time / duration) * 100
+                    out_time_ms =
+                        int(
+                            line.split(
+                                "=",
+                                1
+                            )[1]
+                        )
+
+
+                    if duration:
+
+                        current_seconds =
+                            out_time_ms / 1_000_000
+
+
+                        percent =
+                            int(
+                                (
+                                    current_seconds /
+                                    duration
+                                ) * 100
+                            )
+
+
+                        percent =
+                            max(
+                                1,
+                                min(
+                                    99,
+                                    percent
+                                )
+                            )
+
+
+                        if percent > last_percent:
+
+                            last_percent =
+                                percent
+
+
+                            set_progress(
+                                job_id,
+                                percent,
+                                "processing",
+                                status_text=(
+                                    "Optimizing video..."
+                                )
+                            )
+
+
+                except Exception as e:
+
+                    print(
+                        "PROGRESS PARSE ERROR:",
+                        repr(e)
                     )
 
-                    # Never show 100 until the process really exits.
-                    percent = max(0, min(99, percent))
-                    progress_store[job_id] = percent
 
-                except (ValueError, ZeroDivisionError):
-                    pass
+        return_code =
+            process.wait()
 
-        process.wait()
 
-        if process.returncode != 0:
-            progress_store[job_id] = -1
-            raise HTTPException(
-                status_code=500,
-                detail="FFmpeg video processing failed."
+        stderr_thread.join(
+            timeout=2
+        )
+
+
+        print(
+            "FFMPEG EXIT CODE:",
+            return_code
+        )
+
+
+        if return_code != 0:
+
+            error_text =
+                "\n".join(
+                    stderr_lines[-20:]
+                )
+
+
+            print("")
+            print(
+                "FFMPEG FAILED:"
+            )
+            print(
+                error_text
+            )
+            print("")
+
+
+            set_progress(
+                job_id,
+                0,
+                "error",
+                status_text="FFmpeg failed",
+                error=(
+                    "FFmpeg processing failed. "
+                    + (
+                        error_text[-1500:]
+                        if error_text
+                        else
+                        "No FFmpeg error was returned."
+                    )
+                )
             )
 
-        if not os.path.exists(output_path):
-            progress_store[job_id] = -1
-            raise HTTPException(
-                status_code=500,
-                detail="Output video generate nahi hui."
+            return
+
+
+        if not os.path.exists(
+            output_path
+        ):
+
+            set_progress(
+                job_id,
+                0,
+                "error",
+                status_text="Output file missing",
+                error=(
+                    "FFmpeg finished but "
+                    "the output file was not created."
+                )
             )
 
-        # 100 means FFmpeg actually finished successfully.
-        progress_store[job_id] = 100
+            return
 
-        return {
-            "status": "success",
-            "download_url": f"/outputs/{output_filename}"
-        }
 
-    except HTTPException:
-        raise
+        output_size =
+            os.path.getsize(
+                output_path
+            )
+
+
+        if output_size <= 0:
+
+            set_progress(
+                job_id,
+                0,
+                "error",
+                status_text="Empty output",
+                error="FFmpeg created an empty file."
+            )
+
+            return
+
+
+        # -------------------------------------------------
+        # ONLY NOW = 100%
+        # -------------------------------------------------
+
+        set_progress(
+            job_id,
+            100,
+            "completed",
+            status_text="Complete!",
+            download_url=(
+                "/outputs/" +
+                os.path.basename(
+                    output_path
+                )
+            )
+        )
+
+
+        print(
+            "SUCCESS:",
+            output_path
+        )
+
+
+        # Delete original upload after success
+
+        try:
+
+            os.remove(
+                input_path
+            )
+
+        except Exception:
+            pass
+
 
     except Exception as e:
-        progress_store[job_id] = -1
-        raise HTTPException(
-            status_code=500,
-            detail=f"FFmpeg Error: {str(e)}"
+
+        print("")
+        print(
+            "WORKER ERROR:",
+            repr(e)
+        )
+        print("")
+
+
+        set_progress(
+            job_id,
+            0,
+            "error",
+            status_text="Processing error",
+            error=str(e)
         )
 
-    finally:
-        if os.path.exists(input_path):
-            os.remove(input_path)
 
+# =========================================================
+# PROGRESS API
+# =========================================================
 
 @app.get("/api/progress/{job_id}")
-async def get_progress(job_id: str):
-    return {
-        "progress": progress_store.get(job_id, 0)
-    }
+def get_progress(job_id: str):
 
-
-@app.get("/outputs/{filename}")
-async def get_output_file(filename: str):
-    safe_name = os.path.basename(filename)
-    file_path = os.path.join(OUTPUT_DIR, safe_name)
-
-    if os.path.exists(file_path):
-        return FileResponse(
-            file_path,
-            media_type="video/mp4",
-            filename=safe_name
+    data =
+        progress_store.get(
+            job_id
         )
 
-    raise HTTPException(
-        status_code=404,
-        detail="File nahi mili"
+
+    if not data:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found."
+        )
+
+
+    return data
+
+
+# =========================================================
+# OUTPUT DOWNLOAD
+# =========================================================
+
+@app.get("/outputs/{filename}")
+def download_output(
+    filename: str
+):
+
+    safe_name =
+        Path(filename).name
+
+
+    file_path =
+        OUTPUT_DIR / safe_name
+
+
+    if not file_path.exists():
+
+        raise HTTPException(
+            status_code=404,
+            detail="Output file not found."
+        )
+
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="video/mp4",
+        filename=safe_name
+    )
+
+
+# =========================================================
+# STARTUP INFO
+# =========================================================
+
+@app.on_event("startup")
+def startup_event():
+
+    print("")
+    print("========================================")
+    print("SMOOTH.PK STARTED")
+    print("========================================")
+    print(
+        "FFmpeg:",
+        FFMPEG_EXE or "NOT FOUND"
+    )
+    print(
+        "FFprobe:",
+        FFPROBE_EXE or "NOT FOUND"
+    )
+    print("========================================")
+    print("")
+
+
+# =========================================================
+# LOCAL RUN
+# =========================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    port =
+        int(
+            os.environ.get(
+                "PORT",
+                "8000"
+            )
+        )
+
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
     )
